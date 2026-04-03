@@ -1,0 +1,14 @@
+[phases.setup]
+nixPkgs = [
+  "python311",
+  "chromium",
+  "chromedriver",
+  "gcc",
+  "zlib",
+]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python run_bot.py"
