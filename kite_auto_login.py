@@ -1,23 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║   KITE AUTO-LOGIN HELPER                                         ║
-║   Works on: Local PC + Railway.app cloud                        ║
+║   Using: Playwright (works perfectly on Railway)                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 import os
 import time
-import subprocess
 import pyotp
 import requests
 import logging
 from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.sync_api import sync_playwright
 from kiteconnect import KiteConnect
 
 # ─────────────────────────────────────────────
@@ -81,178 +75,116 @@ def load_token():
 
 
 # ─────────────────────────────────────────────
-#  FIND CHROME + CHROMEDRIVER PATHS
-# ─────────────────────────────────────────────
-def find_chrome_paths():
-    """
-    Railway/Nix pe Chrome alag jagah hota hai.
-    'which' command se dhundho.
-    """
-    chrome_names = ["chromium", "chromium-browser", "google-chrome", "chrome"]
-    driver_names = ["chromedriver"]
-
-    chrome_bin = None
-    driver_bin = None
-
-    for name in chrome_names:
-        try:
-            result = subprocess.run(["which", name], capture_output=True, text=True)
-            if result.returncode == 0:
-                chrome_bin = result.stdout.strip()
-                log.info(f"✅ Chrome found: {chrome_bin}")
-                break
-        except Exception:
-            pass
-
-    for name in driver_names:
-        try:
-            result = subprocess.run(["which", name], capture_output=True, text=True)
-            if result.returncode == 0:
-                driver_bin = result.stdout.strip()
-                log.info(f"✅ ChromeDriver found: {driver_bin}")
-                break
-        except Exception:
-            pass
-
-    # Nix store fallback — find in /nix
-    if not chrome_bin:
-        try:
-            result = subprocess.run(
-                ["find", "/nix", "-name", "chromium", "-type", "f"],
-                capture_output=True, text=True, timeout=10
-            )
-            paths = [p for p in result.stdout.strip().split("\n") if p and "bin" in p]
-            if paths:
-                chrome_bin = paths[0]
-                log.info(f"✅ Chrome found in nix store: {chrome_bin}")
-        except Exception:
-            pass
-
-    if not driver_bin:
-        try:
-            result = subprocess.run(
-                ["find", "/nix", "-name", "chromedriver", "-type", "f"],
-                capture_output=True, text=True, timeout=10
-            )
-            paths = [p for p in result.stdout.strip().split("\n") if p and "bin" in p]
-            if paths:
-                driver_bin = paths[0]
-                log.info(f"✅ ChromeDriver found in nix store: {driver_bin}")
-        except Exception:
-            pass
-
-    return chrome_bin, driver_bin
-
-
-def get_driver():
-    chrome_opts = Options()
-    chrome_opts.add_argument("--headless=new")
-    chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--disable-dev-shm-usage")
-    chrome_opts.add_argument("--disable-gpu")
-    chrome_opts.add_argument("--window-size=1280,800")
-    chrome_opts.add_argument("--remote-debugging-port=9222")
-
-    # Railway / Linux
-    if os.name != "nt":
-        chrome_bin, driver_bin = find_chrome_paths()
-
-        if chrome_bin:
-            chrome_opts.binary_location = chrome_bin
-
-        if driver_bin:
-            log.info(f"Using ChromeDriver: {driver_bin}")
-            return webdriver.Chrome(
-                service=Service(driver_bin),
-                options=chrome_opts
-            )
-        else:
-            log.warning("ChromeDriver not found via which/nix. Trying webdriver-manager...")
-
-    # Local Windows / fallback
-    from webdriver_manager.chrome import ChromeDriverManager
-    return webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=chrome_opts
-    )
-
-
-# ─────────────────────────────────────────────
-#  AUTO LOGIN
+#  AUTO LOGIN — Playwright
 # ─────────────────────────────────────────────
 def auto_login() -> str:
-    log.info("🌐 Starting auto-login...")
-    driver = get_driver()
-    wait   = WebDriverWait(driver, 30)
-    kite   = KiteConnect(api_key=API_KEY)
+    log.info("🌐 Starting auto-login with Playwright...")
+    kite = KiteConnect(api_key=API_KEY)
+    login_url = kite.login_url()
+    request_token = None
 
-    try:
-        driver.get(kite.login_url())
-        time.sleep(2)
-
-        # User ID
-        wait.until(EC.presence_of_element_located((By.ID, "userid"))).send_keys(KITE_USER_ID)
-        time.sleep(0.4)
-
-        # Password
-        driver.find_element(By.ID, "password").send_keys(KITE_PASSWORD)
-        time.sleep(0.4)
-
-        # Submit
-        driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        log.info("🔐 Credentials submitted...")
-        time.sleep(3)
-
-        # TOTP
-        totp_field = wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//input[@type='number']")
-        ))
-
-        if TOTP_SECRET:
-            totp_code = pyotp.TOTP(TOTP_SECRET).now()
-            log.info("🔑 Auto TOTP generated.")
-        else:
-            send_telegram(
-                "🔐 <b>TOTP Required</b>\n"
-                "Telegram pe 6-digit code reply karo\n"
-                "<i>(60 seconds ke andar)</i>"
-            )
-            totp_code = wait_for_telegram_totp()
-
-        totp_field.send_keys(totp_code)
-        time.sleep(0.5)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+            ]
+        )
+        page = browser.new_page()
 
         try:
-            driver.find_element(By.XPATH, "//button[@type='submit']").click()
-        except Exception:
-            pass
+            # ── Step 1: Open login page ──
+            log.info(f"Opening login page...")
+            page.goto(login_url, wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(1500)
 
-        time.sleep(5)
-        current_url = driver.current_url
+            # ── Step 2: Enter User ID ──
+            page.fill("#userid", KITE_USER_ID)
+            page.wait_for_timeout(400)
 
-        if "request_token=" not in current_url:
-            time.sleep(4)
-            current_url = driver.current_url
+            # ── Step 3: Enter Password ──
+            page.fill("#password", KITE_PASSWORD)
+            page.wait_for_timeout(400)
 
-        if "request_token=" not in current_url:
-            raise Exception(f"request_token not found. URL: {current_url}")
+            # ── Step 4: Click Login ──
+            page.click("button[type='submit']")
+            log.info("🔐 Credentials submitted, waiting for 2FA...")
+            page.wait_for_timeout(3000)
 
-        request_token = current_url.split("request_token=")[1].split("&")[0]
-        log.info(f"✅ request_token: {request_token[:8]}...")
+            # ── Step 5: TOTP ──
+            try:
+                page.wait_for_selector("input[type='number']", timeout=15000)
+            except Exception:
+                # Try alternate selectors
+                page.wait_for_selector("input[label='External TOTP']", timeout=5000)
 
-    except Exception as e:
-        log.error(f"Login error: {e}")
-        try:
-            driver.save_screenshot("/tmp/login_error.png")
-        except Exception:
-            pass
-        send_telegram(f"❌ <b>Auto-Login Failed</b>\n{str(e)[:200]}")
-        raise
-    finally:
-        driver.quit()
+            if TOTP_SECRET:
+                totp_code = pyotp.TOTP(TOTP_SECRET).now()
+                log.info("🔑 Auto TOTP generated.")
+            else:
+                send_telegram(
+                    "🔐 <b>TOTP Required</b>\n"
+                    "Telegram pe 6-digit code reply karo\n"
+                    "<i>(60 seconds ke andar)</i>"
+                )
+                totp_code = wait_for_telegram_totp()
 
+            page.fill("input[type='number']", totp_code)
+            page.wait_for_timeout(500)
+
+            # ── Step 6: Submit TOTP ──
+            try:
+                page.click("button[type='submit']")
+            except Exception:
+                pass
+
+            # ── Step 7: Wait for redirect ──
+            log.info("⏳ Waiting for redirect...")
+            page.wait_for_timeout(5000)
+
+            current_url = page.url
+            log.info(f"Current URL: {current_url[:80]}")
+
+            # Wait more if needed
+            if "request_token=" not in current_url:
+                page.wait_for_timeout(4000)
+                current_url = page.url
+
+            if "request_token=" not in current_url:
+                # Try waiting for URL change
+                try:
+                    page.wait_for_url("**/request_token=**", timeout=10000)
+                    current_url = page.url
+                except Exception:
+                    pass
+
+            if "request_token=" not in current_url:
+                # Screenshot for debug
+                page.screenshot(path="/tmp/login_debug.png")
+                raise Exception(f"request_token not found. URL: {current_url}")
+
+            request_token = current_url.split("request_token=")[1].split("&")[0]
+            log.info(f"✅ request_token captured: {request_token[:8]}...")
+
+        except Exception as e:
+            log.error(f"Login error: {e}")
+            try:
+                page.screenshot(path="/tmp/login_error.png")
+            except Exception:
+                pass
+            send_telegram(f"❌ <b>Auto-Login Failed</b>\n{str(e)[:200]}")
+            raise
+        finally:
+            browser.close()
+
+    # ── Step 8: Generate Access Token ──
     data = kite.generate_session(request_token, api_secret=API_SECRET)
-    return data["access_token"]
+    access_token = data["access_token"]
+    log.info(f"✅ Access token generated!")
+    return access_token
 
 
 # ─────────────────────────────────────────────
@@ -262,7 +194,7 @@ def wait_for_telegram_totp(timeout=90) -> str:
     url      = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     deadline = time.time() + timeout
     try:
-        r      = requests.get(url, params={"timeout": 0}, timeout=5)
+        r       = requests.get(url, params={"timeout": 0}, timeout=5)
         updates = r.json().get("result", [])
         offset  = updates[-1]["update_id"] + 1 if updates else 0
     except Exception:
@@ -275,7 +207,7 @@ def wait_for_telegram_totp(timeout=90) -> str:
                 offset = update["update_id"] + 1
                 msg = update.get("message", {}).get("text", "").strip()
                 if msg.isdigit() and len(msg) == 6:
-                    log.info(f"📲 TOTP received.")
+                    log.info("📲 TOTP received from Telegram.")
                     return msg
         except Exception:
             time.sleep(2)
