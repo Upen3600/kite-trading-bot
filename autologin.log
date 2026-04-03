@@ -1,0 +1,13 @@
+2026-04-03 15:43:18,684 | INFO | ====== WebDriver manager ======
+2026-04-03 15:43:19,831 | INFO | Get LATEST chromedriver version for google-chrome
+2026-04-03 15:43:20,266 | INFO | Get LATEST chromedriver version for google-chrome
+2026-04-03 15:43:20,521 | INFO | There is no [win64] chromedriver "146.0.7680.165" for browser google-chrome "146.0.7680" in cache
+2026-04-03 15:43:20,522 | INFO | Get LATEST chromedriver version for google-chrome
+2026-04-03 15:43:21,405 | INFO | WebDriver version 146.0.7680.165 selected
+2026-04-03 15:43:21,410 | INFO | Modern chrome version https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win32/chromedriver-win32.zip
+2026-04-03 15:43:21,410 | INFO | About to download new driver from https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/win32/chromedriver-win32.zip
+2026-04-03 15:43:22,699 | INFO | Driver downloading response is 200
+2026-04-03 15:43:26,085 | INFO | Get LATEST chromedriver version for google-chrome
+2026-04-03 15:43:26,478 | INFO | Driver has been saved in cache [C:\Users\VARSHA\.wdm\drivers\chromedriver\win64\146.0.7680.165]
+2026-04-03 15:43:29,760 | INFO | Opening: https://kite.zerodha.com/connect/login?api_key=yj3cey9o0ho0gi1b&v=3
+2026-04-03 15:43:44,120 | INFO | Redirected to: http://127.0.0.1/?request_token=qQmHi49mbd4Wp9EK1yjTh15sDuw5X347&action=login&type=login&status=success
