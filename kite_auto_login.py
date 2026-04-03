@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   KITE AUTO-LOGIN HELPER                                         ║
-║   Fix: Intercept redirect URL before chrome-error occurs         ║
+║   KITE AUTO-LOGIN — DEBUG VERSION                                ║
+║   Sends screenshots to Telegram at every step                    ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  TELEGRAM
+#  TELEGRAM — Text + Photo
 # ─────────────────────────────────────────────
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -47,6 +47,20 @@ def send_telegram(msg: str):
         }, timeout=10)
     except Exception as e:
         log.error(f"Telegram error: {e}")
+
+
+def send_screenshot(path: str, caption: str = ""):
+    """Send screenshot image to Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try:
+        with open(path, "rb") as f:
+            requests.post(url, data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "caption": caption
+            }, files={"photo": f}, timeout=15)
+        log.info(f"📸 Screenshot sent: {caption}")
+    except Exception as e:
+        log.error(f"Screenshot send error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -75,14 +89,15 @@ def load_token():
 
 
 # ─────────────────────────────────────────────
-#  AUTO LOGIN — Intercept redirect
+#  AUTO LOGIN
 # ─────────────────────────────────────────────
 def auto_login() -> str:
-    log.info("🌐 Starting auto-login with Playwright...")
+    log.info("🌐 Starting auto-login (DEBUG mode)...")
     kite      = KiteConnect(api_key=API_KEY)
     login_url = kite.login_url()
 
-    captured_token = {"value": None}   # mutable container for closure
+    captured_token   = {"value": None}
+    intercepted_urls = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -94,19 +109,20 @@ def auto_login() -> str:
                 "--disable-setuid-sandbox",
             ]
         )
-
         context = browser.new_context()
 
-        # ── KEY FIX: Intercept ALL requests ──
-        # Kite redirects to 127.0.0.1/?request_token=xxx
-        # We catch it BEFORE browser tries to load it (which fails)
+        # ── Intercept ALL requests — log every URL ──
         def handle_request(route, request):
             url = request.url
+            intercepted_urls.append(url)
+
             if "request_token=" in url:
                 token = url.split("request_token=")[1].split("&")[0]
                 captured_token["value"] = token
-                log.info(f"✅ request_token intercepted: {token[:8]}...")
-                # Abort the request — we don't need it to load
+                log.info(f"✅ request_token INTERCEPTED: {token[:8]}...")
+                route.abort()
+            elif url.startswith("http://127.0.0.1") or url.startswith("https://127.0.0.1"):
+                log.info(f"🔍 Redirect to 127: {url[:100]}")
                 route.abort()
             else:
                 route.continue_()
@@ -115,63 +131,94 @@ def auto_login() -> str:
         page = context.new_page()
 
         try:
-            # ── Open login page ──
+            # Step 1: Login page
             log.info("Opening Kite login page...")
             page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2000)
+            page.screenshot(path="/tmp/step1_login.png")
+            send_screenshot("/tmp/step1_login.png", "Step 1: Login page loaded")
 
-            # ── Enter User ID ──
+            # Step 2: Fill credentials
             page.wait_for_selector("#userid", timeout=15000)
             page.fill("#userid", KITE_USER_ID)
             page.wait_for_timeout(400)
-
-            # ── Enter Password ──
             page.fill("#password", KITE_PASSWORD)
             page.wait_for_timeout(400)
-
-            # ── Click Login ──
             page.click("button[type='submit']")
-            log.info("🔐 Credentials submitted, waiting for 2FA...")
+            log.info("🔐 Credentials submitted...")
             page.wait_for_timeout(3000)
 
-            # ── TOTP ──
-            page.wait_for_selector("input[type='number']", timeout=15000)
+            page.screenshot(path="/tmp/step2_after_login.png")
+            send_screenshot("/tmp/step2_after_login.png", "Step 2: After login submit")
 
-            if TOTP_SECRET:
-                totp_code = pyotp.TOTP(TOTP_SECRET).now()
-                log.info("🔑 Auto TOTP generated.")
-            else:
-                send_telegram(
-                    "🔐 <b>TOTP Required</b>\n"
-                    "Telegram pe 6-digit code reply karo\n"
-                    "<i>(60 seconds ke andar)</i>"
-                )
-                totp_code = wait_for_telegram_totp()
-
-            page.fill("input[type='number']", totp_code)
-            page.wait_for_timeout(500)
-
-            # ── Submit TOTP ──
+            # Step 3: TOTP
+            log.info("Looking for TOTP field...")
             try:
-                page.click("button[type='submit']")
+                page.wait_for_selector("input[type='number']", timeout=10000)
+                totp_found = True
             except Exception:
-                pass
+                totp_found = False
+                log.warning("TOTP number input not found, trying other selectors...")
+                try:
+                    page.wait_for_selector("input[autocomplete='one-time-code']", timeout=5000)
+                    totp_found = True
+                except Exception:
+                    pass
 
-            # ── Wait for redirect to be intercepted (max 15 sec) ──
-            log.info("⏳ Waiting for request_token...")
-            for _ in range(30):
+            page.screenshot(path="/tmp/step3_totp_screen.png")
+            send_screenshot("/tmp/step3_totp_screen.png", f"Step 3: TOTP screen (found={totp_found})")
+
+            # Send current URL info
+            send_telegram(f"🔍 <b>Debug Info</b>\nURL after login: <code>{page.url[:100]}</code>")
+
+            if totp_found:
+                if TOTP_SECRET:
+                    totp_code = pyotp.TOTP(TOTP_SECRET).now()
+                    log.info(f"🔑 Auto TOTP: {totp_code}")
+                else:
+                    send_telegram("🔐 <b>TOTP Required</b>\n6-digit code reply karo (60s)")
+                    totp_code = wait_for_telegram_totp()
+
+                # Try filling TOTP
+                try:
+                    page.fill("input[type='number']", totp_code)
+                except Exception:
+                    page.fill("input[autocomplete='one-time-code']", totp_code)
+
+                page.wait_for_timeout(500)
+
+                try:
+                    page.click("button[type='submit']")
+                    log.info("TOTP submitted.")
+                except Exception:
+                    log.warning("Submit button not found after TOTP.")
+
+                page.wait_for_timeout(3000)
+                page.screenshot(path="/tmp/step4_after_totp.png")
+                send_screenshot("/tmp/step4_after_totp.png", "Step 4: After TOTP submit")
+                send_telegram(f"🔍 URL after TOTP: <code>{page.url[:150]}</code>")
+
+            # Step 5: Wait for token (15 sec)
+            log.info("⏳ Waiting for request_token intercept...")
+            for i in range(30):
                 if captured_token["value"]:
                     break
                 time.sleep(0.5)
+                if i % 10 == 9:
+                    page.screenshot(path=f"/tmp/wait_{i}.png")
+                    send_screenshot(f"/tmp/wait_{i}.png", f"⏳ Waiting... {i+1}/30\nURL: {page.url[:80]}")
 
             if not captured_token["value"]:
-                page.screenshot(path="/tmp/login_debug.png")
-                raise Exception("request_token not captured within timeout.")
+                # Send all intercepted URLs for debug
+                url_log = "\n".join(intercepted_urls[-10:])
+                send_telegram(f"🔍 <b>Last 10 intercepted URLs:</b>\n<code>{url_log[:500]}</code>")
+                raise Exception(f"request_token not captured. Last URL: {page.url}")
 
         except Exception as e:
             log.error(f"Login error: {e}")
             try:
                 page.screenshot(path="/tmp/login_error.png")
+                send_screenshot("/tmp/login_error.png", f"❌ Error: {str(e)[:100]}")
             except Exception:
                 pass
             send_telegram(f"❌ <b>Auto-Login Failed</b>\n{str(e)[:200]}")
@@ -179,9 +226,8 @@ def auto_login() -> str:
         finally:
             browser.close()
 
-    # ── Generate Access Token ──
     request_token = captured_token["value"]
-    log.info(f"🔑 Generating session with request_token: {request_token[:8]}...")
+    log.info(f"🔑 Generating session...")
     data         = kite.generate_session(request_token, api_secret=API_SECRET)
     access_token = data["access_token"]
     log.info("✅ Access token generated!")
@@ -208,12 +254,10 @@ def wait_for_telegram_totp(timeout=90) -> str:
                 offset = update["update_id"] + 1
                 msg = update.get("message", {}).get("text", "").strip()
                 if msg.isdigit() and len(msg) == 6:
-                    log.info("📲 TOTP received from Telegram.")
                     return msg
         except Exception:
             time.sleep(2)
-
-    raise TimeoutError("TOTP not received in time.")
+    raise TimeoutError("TOTP not received.")
 
 
 # ─────────────────────────────────────────────
@@ -226,7 +270,7 @@ def get_access_token(force_refresh: bool = False) -> str:
             return cached
 
     send_telegram(
-        f"🌅 <b>Auto-Login Starting</b>\n"
+        f"🌅 <b>Auto-Login Starting (Debug)</b>\n"
         f"📅 {datetime.now().strftime('%d %b %Y, %H:%M')}"
     )
     access_token = auto_login()
