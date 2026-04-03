@@ -1,18 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║   KITE AUTO-LOGIN HELPER                                         ║
-║   Automatically fetches Access Token every morning               ║
-║   Uses: Selenium (headless browser) + Kite Connect API           ║
+║   Works on: Local PC + Railway.app cloud                        ║
 ╚══════════════════════════════════════════════════════════════════╝
-
-HOW IT WORKS:
-  1. Opens Kite login page in headless Chrome
-  2. Fills userid + password automatically
-  3. Waits for you to enter TOTP (2FA) — or auto-fills if you provide secret
-  4. Captures the request_token from redirect URL
-  5. Exchanges it for access_token via Kite API
-  6. Saves token to token.txt
-  7. Sends Telegram confirmation
 """
 
 import os
@@ -27,38 +17,31 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 from kiteconnect import KiteConnect
 
 # ─────────────────────────────────────────────
-#  ⚙️  YOUR CREDENTIALS — Fill these once
+#  CREDENTIALS — Railway Variables se auto-load
 # ─────────────────────────────────────────────
-API_KEY        = "yj3cey9o0ho0gi1b"
-API_SECRET     = "lfi1nsig48dhlv00ryowue0ey07b96nc"         # <-- Kite Developer Console se copy karo
-KITE_USER_ID   = "OZ4378"         # <-- Your Zerodha Client ID (e.g. AB1234)
-KITE_PASSWORD  = "Upen@2658$"         # <-- Your Zerodha login password
-TOTP_SECRET    = "BXG2SWCEE5PONPTNDUP2COXCMHFW732X"         # <-- Authenticator app ka secret key (optional)
-                             #     Agar blank rakho → manually TOTP enter karna hoga
+API_KEY          = os.environ.get("API_KEY",          "yj3cey9o0ho0gi1b")
+API_SECRET       = os.environ.get("API_SECRET",       "")
+KITE_USER_ID     = os.environ.get("KITE_USER_ID",     "")
+KITE_PASSWORD    = os.environ.get("KITE_PASSWORD",    "")
+TOTP_SECRET      = os.environ.get("TOTP_SECRET",      "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8620220458:AAG-oxvhWhPio7iX9pWCk-0AFovl5KrUXxc")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003780954866")
 
-TELEGRAM_TOKEN   = "8620220458:AAG-oxvhWhPio7iX9pWCk-0AFovl5KrUXxc"
-TELEGRAM_CHAT_ID = "-1003780954866"
-
-TOKEN_FILE     = "token.txt"   # Access token yahan save hoga
+TOKEN_FILE = "/tmp/token.txt"   # Railway pe /tmp writable hota hai
 
 # ─────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler("autologin.log"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  TELEGRAM HELPER
+#  TELEGRAM
 # ─────────────────────────────────────────────
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -73,25 +56,23 @@ def send_telegram(msg: str):
 
 
 # ─────────────────────────────────────────────
-#  SAVE / LOAD TOKEN
+#  TOKEN SAVE / LOAD
 # ─────────────────────────────────────────────
 def save_token(access_token: str):
     with open(TOKEN_FILE, "w") as f:
         f.write(f"{access_token}\n{datetime.now().strftime('%Y-%m-%d')}")
-    log.info(f"✅ Token saved to {TOKEN_FILE}")
+    log.info("✅ Token saved.")
 
 
-def load_token() -> str | None:
-    """Load token if it was generated today."""
+def load_token():
     if not os.path.exists(TOKEN_FILE):
         return None
     try:
         with open(TOKEN_FILE, "r") as f:
             lines = f.read().strip().split("\n")
-        token = lines[0]
+        token     = lines[0]
         saved_date = lines[1] if len(lines) > 1 else ""
-        today = datetime.now().strftime("%Y-%m-%d")
-        if saved_date == today and token:
+        if saved_date == datetime.now().strftime("%Y-%m-%d") and token:
             log.info("✅ Valid token found for today.")
             return token
     except Exception:
@@ -100,101 +81,88 @@ def load_token() -> str | None:
 
 
 # ─────────────────────────────────────────────
-#  SELENIUM AUTO-LOGIN
+#  CHROME DRIVER — Local PC + Railway/Linux
 # ─────────────────────────────────────────────
-def auto_login() -> str:
-    """
-    Automates Kite web login and returns access_token.
-    Steps:
-      1. Open login.zerodha.com
-      2. Fill userid + password
-      3. Handle TOTP (auto or manual)
-      4. Capture request_token from redirect
-      5. Generate access_token
-    """
-    log.info("🌐 Starting auto-login...")
-
-    # ── Chrome Options ──
+def get_driver():
     chrome_opts = Options()
-    chrome_opts.add_argument("--headless=new")       # invisible browser
+    chrome_opts.add_argument("--headless=new")
     chrome_opts.add_argument("--no-sandbox")
     chrome_opts.add_argument("--disable-dev-shm-usage")
     chrome_opts.add_argument("--disable-gpu")
     chrome_opts.add_argument("--window-size=1280,800")
-    chrome_opts.add_argument("--log-level=3")
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=chrome_opts
-    )
-    wait = WebDriverWait(driver, 30)
+    # Railway / Linux — Nixpacks se Chromium install hoga
+    if os.path.exists("/usr/bin/chromium"):
+        chrome_opts.binary_location = "/usr/bin/chromium"
+        return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=chrome_opts)
 
-    kite = KiteConnect(api_key=API_KEY)
-    login_url = kite.login_url()
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        chrome_opts.binary_location = "/usr/bin/chromium-browser"
+        return webdriver.Chrome(service=Service("/usr/bin/chromedriver"), options=chrome_opts)
+
+    else:
+        # Local Windows/Mac — webdriver-manager
+        from webdriver_manager.chrome import ChromeDriverManager
+        return webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_opts
+        )
+
+
+# ─────────────────────────────────────────────
+#  AUTO LOGIN
+# ─────────────────────────────────────────────
+def auto_login() -> str:
+    log.info("🌐 Starting auto-login...")
+    driver = get_driver()
+    wait   = WebDriverWait(driver, 30)
+    kite   = KiteConnect(api_key=API_KEY)
 
     try:
-        # ── Step 1: Open login page ──
-        log.info(f"Opening: {login_url}")
-        driver.get(login_url)
+        driver.get(kite.login_url())
         time.sleep(2)
 
-        # ── Step 2: Enter User ID ──
-        user_field = wait.until(EC.presence_of_element_located((By.ID, "userid")))
-        user_field.clear()
-        user_field.send_keys(KITE_USER_ID)
-        time.sleep(0.5)
+        # Step 1: User ID
+        wait.until(EC.presence_of_element_located((By.ID, "userid"))).send_keys(KITE_USER_ID)
+        time.sleep(0.4)
 
-        # ── Step 3: Enter Password ──
-        pass_field = driver.find_element(By.ID, "password")
-        pass_field.clear()
-        pass_field.send_keys(KITE_PASSWORD)
-        time.sleep(0.5)
+        # Step 2: Password
+        driver.find_element(By.ID, "password").send_keys(KITE_PASSWORD)
+        time.sleep(0.4)
 
-        # ── Step 4: Click Login ──
-        login_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-        login_btn.click()
-        log.info("🔐 Login submitted, waiting for 2FA...")
+        # Step 3: Submit
+        driver.find_element(By.XPATH, "//button[@type='submit']").click()
+        log.info("🔐 Credentials submitted...")
         time.sleep(3)
 
-        # ── Step 5: Handle TOTP ──
+        # Step 4: TOTP
         totp_field = wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//input[@type='number' or @label='External TOTP' or @placeholder]")
+            (By.XPATH, "//input[@type='number']")
         ))
 
         if TOTP_SECRET:
-            # Auto-generate TOTP
-            totp = pyotp.TOTP(TOTP_SECRET)
-            totp_code = totp.now()
-            log.info(f"🔑 Auto TOTP: {totp_code}")
+            totp_code = pyotp.TOTP(TOTP_SECRET).now()
+            log.info("🔑 Auto TOTP generated.")
         else:
-            # Manual TOTP — ask via Telegram then wait
             send_telegram(
-                "🔐 <b>Kite Login — TOTP Required</b>\n"
-                "Apna 6-digit authenticator code reply karo\n"
-                "<i>(60 seconds me karo)</i>"
+                "🔐 <b>TOTP Required</b>\n"
+                "Telegram pe 6-digit code reply karo\n"
+                "<i>(60 seconds ke andar)</i>"
             )
             totp_code = wait_for_telegram_totp()
 
-        totp_field.clear()
         totp_field.send_keys(totp_code)
         time.sleep(0.5)
 
-        # ── Step 6: Submit TOTP ──
         try:
-            submit_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-            submit_btn.click()
+            driver.find_element(By.XPATH, "//button[@type='submit']").click()
         except Exception:
-            pass  # Some flows auto-submit
+            pass
 
-        log.info("⏳ Waiting for redirect with request_token...")
-        time.sleep(4)
-
-        # ── Step 7: Capture request_token from URL ──
+        time.sleep(5)
         current_url = driver.current_url
-        log.info(f"Redirected to: {current_url}")
 
         if "request_token=" not in current_url:
-            # Wait a bit more
             time.sleep(4)
             current_url = driver.current_url
 
@@ -205,108 +173,68 @@ def auto_login() -> str:
         log.info(f"✅ request_token captured: {request_token[:8]}...")
 
     except Exception as e:
-        log.error(f"Login failed: {e}")
-        driver.save_screenshot("login_error.png")
-        send_telegram(f"❌ <b>Auto-Login Failed</b>\nError: {str(e)[:200]}")
+        log.error(f"Login error: {e}")
+        try:
+            driver.save_screenshot("/tmp/login_error.png")
+        except Exception:
+            pass
+        send_telegram(f"❌ <b>Auto-Login Failed</b>\n{str(e)[:200]}")
         raise
     finally:
         driver.quit()
 
-    # ── Step 8: Generate Access Token ──
-    try:
-        data = kite.generate_session(request_token, api_secret=API_SECRET)
-        access_token = data["access_token"]
-        log.info(f"✅ Access token generated: {access_token[:8]}...")
-        return access_token
-    except Exception as e:
-        log.error(f"Session generation failed: {e}")
-        raise
+    # Generate access token
+    data = kite.generate_session(request_token, api_secret=API_SECRET)
+    return data["access_token"]
 
 
 # ─────────────────────────────────────────────
 #  TELEGRAM TOTP LISTENER (manual fallback)
 # ─────────────────────────────────────────────
 def wait_for_telegram_totp(timeout=90) -> str:
-    """Poll Telegram for a 6-digit reply (manual TOTP input)."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 30, "allowed_updates": ["message"]}
+    url      = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     deadline = time.time() + timeout
-
-    # Get current offset
     try:
-        r = requests.get(url, params={**params, "timeout": 0}, timeout=5)
+        r = requests.get(url, params={"timeout": 0}, timeout=5)
         updates = r.json().get("result", [])
-        offset = updates[-1]["update_id"] + 1 if updates else 0
+        offset  = updates[-1]["update_id"] + 1 if updates else 0
     except Exception:
         offset = 0
 
-    log.info("⏳ Waiting for TOTP from Telegram...")
     while time.time() < deadline:
         try:
-            r = requests.get(url, params={**params, "offset": offset}, timeout=35)
-            updates = r.json().get("result", [])
-            for update in updates:
+            r = requests.get(url, params={"timeout": 30, "offset": offset}, timeout=35)
+            for update in r.json().get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message", {}).get("text", "").strip()
                 if msg.isdigit() and len(msg) == 6:
-                    log.info(f"📲 TOTP received from Telegram: {msg}")
+                    log.info(f"📲 TOTP received: {msg}")
                     return msg
-        except Exception as e:
-            log.warning(f"Telegram poll error: {e}")
+        except Exception:
             time.sleep(2)
 
-    raise TimeoutError("TOTP not received within timeout.")
+    raise TimeoutError("TOTP not received in time.")
 
 
 # ─────────────────────────────────────────────
 #  MAIN — Get Token (cached or fresh)
 # ─────────────────────────────────────────────
 def get_access_token(force_refresh: bool = False) -> str:
-    """
-    Returns today's access token.
-    Uses cached token if already generated today.
-    """
     if not force_refresh:
         cached = load_token()
         if cached:
             return cached
 
-    log.info("🔄 No valid token found. Starting fresh login...")
     send_telegram(
         f"🌅 <b>Auto-Login Starting</b>\n"
-        f"📅 {datetime.now().strftime('%d %b %Y, %H:%M')}\n"
-        f"⏳ Please wait..."
+        f"📅 {datetime.now().strftime('%d %b %Y, %H:%M')}"
     )
-
     access_token = auto_login()
     save_token(access_token)
-
-    send_telegram(
-        f"✅ <b>Login Successful!</b>\n"
-        f"🔑 Access Token generated\n"
-        f"🤖 Trading bot will start now..."
-    )
+    send_telegram("✅ <b>Login Successful!</b>\n🤖 Bot starting now...")
     return access_token
 
 
-# ─────────────────────────────────────────────
-#  STANDALONE RUN (test karne ke liye)
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n" + "="*50)
-    print("  KITE AUTO-LOGIN HELPER")
-    print("="*50)
-
-    if not API_SECRET:
-        print("\n⚠️  ERROR: API_SECRET blank hai!")
-        print("   → Kite Developer Console pe jao")
-        print("   → API_SECRET copy karo aur is file me paste karo")
-        exit(1)
-
-    if not KITE_USER_ID or not KITE_PASSWORD:
-        print("\n⚠️  ERROR: KITE_USER_ID ya KITE_PASSWORD blank hai!")
-        exit(1)
-
     token = get_access_token()
-    print(f"\n✅ Access Token: {token[:8]}...{token[-4:]}")
-    print(f"📁 Saved to: {TOKEN_FILE}")
+    print(f"✅ Token: {token[:8]}...{token[-4:]}")
