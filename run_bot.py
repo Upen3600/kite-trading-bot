@@ -3,28 +3,71 @@
 ║   MAIN LAUNCHER — Hybrid Trading Bot                             ║
 ║   Auto-login + Bot start in one command                          ║
 ╚══════════════════════════════════════════════════════════════════╝
-
-RUN: python run_bot.py
 """
 
+import os
+import sys
+import subprocess
 import schedule
 import time
 import logging
 from datetime import datetime
-from kite_auto_login import get_access_token
-from hybrid_trading_bot import HybridBot, init_kite, send_telegram
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler("bot_main.log"),
         logging.StreamHandler()
     ]
 )
 log = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────
+#  STEP 0: Ensure Playwright browser installed
+# ─────────────────────────────────────────────
+def ensure_playwright():
+    browser_path = os.path.expanduser("~/.cache/ms-playwright")
+    chromium_ready = False
+
+    if os.path.exists(browser_path):
+        for root, dirs, files in os.walk(browser_path):
+            for f in files:
+                if "chrome" in f.lower() or "chromium" in f.lower():
+                    chromium_ready = True
+                    break
+
+    if not chromium_ready:
+        log.info("📦 Installing Playwright Chromium browser...")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True, timeout=300
+            )
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                check=True, timeout=120
+            )
+            log.info("✅ Playwright Chromium installed successfully.")
+        except subprocess.CalledProcessError as e:
+            log.error(f"❌ Playwright install failed: {e}")
+            # Try without install-deps (may not have sudo)
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    check=True, timeout=300
+                )
+                log.info("✅ Playwright Chromium installed (without deps).")
+            except Exception as e2:
+                log.error(f"❌ Playwright install failed again: {e2}")
+                raise
+    else:
+        log.info("✅ Playwright Chromium already installed.")
+
+
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 def start():
     print("\n" + "═"*55)
     print("  🤖  HYBRID TRADING BOT — BankNifty & Nifty")
@@ -33,7 +76,14 @@ def start():
     print("  🎯  Instrument: Options (CE/PE buying)")
     print("═"*55 + "\n")
 
-    # ── Step 1: Get Access Token (auto) ──
+    # ── Ensure browser ready ──
+    ensure_playwright()
+
+    # ── Import after playwright check ──
+    from kite_auto_login import get_access_token
+    from hybrid_trading_bot import HybridBot, init_kite, send_telegram
+
+    # ── Get Access Token ──
     log.info("🔐 Getting access token...")
     try:
         access_token = get_access_token()
@@ -43,24 +93,22 @@ def start():
         send_telegram(f"❌ <b>Bot Failed to Start</b>\nLogin error: {str(e)[:200]}")
         return
 
-    # ── Step 2: Init Kite ──
+    # ── Init Kite ──
     init_kite(access_token)
 
-    # ── Step 3: Setup Bot ──
+    # ── Setup Bot ──
     bot = HybridBot()
 
-    # ── Step 4: Schedule ──
+    # ── Schedule ──
     schedule.every().day.at("09:00").do(bot.reset_day)
     schedule.every().day.at("09:31").do(bot.run_orb_setup)
 
-    # Signal + Monitor every 5 min from 9:31 to 14:00
     for hour in range(9, 15):
         for minute in range(0, 60, 5):
             t = f"{hour:02d}:{minute:02d}"
             schedule.every().day.at(t).do(bot.run_signal_check)
             schedule.every().day.at(t).do(bot.run_monitor)
 
-    # Followup every 15 min
     for hour in range(9, 15):
         for minute in range(0, 60, 15):
             t = f"{hour:02d}:{minute:02d}"
