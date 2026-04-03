@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║   KITE AUTO-LOGIN HELPER                                         ║
-║   Using: Playwright (works perfectly on Railway)                 ║
+║   Fix: Intercept redirect URL before chrome-error occurs         ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 from kiteconnect import KiteConnect
 
 # ─────────────────────────────────────────────
-#  CREDENTIALS — Railway Variables se auto-load
+#  CREDENTIALS
 # ─────────────────────────────────────────────
 API_KEY          = os.environ.get("API_KEY",          "yj3cey9o0ho0gi1b")
 API_SECRET       = os.environ.get("API_SECRET",       "")
@@ -75,13 +75,14 @@ def load_token():
 
 
 # ─────────────────────────────────────────────
-#  AUTO LOGIN — Playwright
+#  AUTO LOGIN — Intercept redirect
 # ─────────────────────────────────────────────
 def auto_login() -> str:
     log.info("🌐 Starting auto-login with Playwright...")
-    kite = KiteConnect(api_key=API_KEY)
+    kite      = KiteConnect(api_key=API_KEY)
     login_url = kite.login_url()
-    request_token = None
+
+    captured_token = {"value": None}   # mutable container for closure
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -93,33 +94,48 @@ def auto_login() -> str:
                 "--disable-setuid-sandbox",
             ]
         )
-        page = browser.new_page()
+
+        context = browser.new_context()
+
+        # ── KEY FIX: Intercept ALL requests ──
+        # Kite redirects to 127.0.0.1/?request_token=xxx
+        # We catch it BEFORE browser tries to load it (which fails)
+        def handle_request(route, request):
+            url = request.url
+            if "request_token=" in url:
+                token = url.split("request_token=")[1].split("&")[0]
+                captured_token["value"] = token
+                log.info(f"✅ request_token intercepted: {token[:8]}...")
+                # Abort the request — we don't need it to load
+                route.abort()
+            else:
+                route.continue_()
+
+        context.route("**/*", handle_request)
+        page = context.new_page()
 
         try:
-            # ── Step 1: Open login page ──
-            log.info(f"Opening login page...")
-            page.goto(login_url, wait_until="networkidle", timeout=30000)
+            # ── Open login page ──
+            log.info("Opening Kite login page...")
+            page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(1500)
 
-            # ── Step 2: Enter User ID ──
+            # ── Enter User ID ──
+            page.wait_for_selector("#userid", timeout=15000)
             page.fill("#userid", KITE_USER_ID)
             page.wait_for_timeout(400)
 
-            # ── Step 3: Enter Password ──
+            # ── Enter Password ──
             page.fill("#password", KITE_PASSWORD)
             page.wait_for_timeout(400)
 
-            # ── Step 4: Click Login ──
+            # ── Click Login ──
             page.click("button[type='submit']")
             log.info("🔐 Credentials submitted, waiting for 2FA...")
             page.wait_for_timeout(3000)
 
-            # ── Step 5: TOTP ──
-            try:
-                page.wait_for_selector("input[type='number']", timeout=15000)
-            except Exception:
-                # Try alternate selectors
-                page.wait_for_selector("input[label='External TOTP']", timeout=5000)
+            # ── TOTP ──
+            page.wait_for_selector("input[type='number']", timeout=15000)
 
             if TOTP_SECRET:
                 totp_code = pyotp.TOTP(TOTP_SECRET).now()
@@ -135,39 +151,22 @@ def auto_login() -> str:
             page.fill("input[type='number']", totp_code)
             page.wait_for_timeout(500)
 
-            # ── Step 6: Submit TOTP ──
+            # ── Submit TOTP ──
             try:
                 page.click("button[type='submit']")
             except Exception:
                 pass
 
-            # ── Step 7: Wait for redirect ──
-            log.info("⏳ Waiting for redirect...")
-            page.wait_for_timeout(5000)
+            # ── Wait for redirect to be intercepted (max 15 sec) ──
+            log.info("⏳ Waiting for request_token...")
+            for _ in range(30):
+                if captured_token["value"]:
+                    break
+                time.sleep(0.5)
 
-            current_url = page.url
-            log.info(f"Current URL: {current_url[:80]}")
-
-            # Wait more if needed
-            if "request_token=" not in current_url:
-                page.wait_for_timeout(4000)
-                current_url = page.url
-
-            if "request_token=" not in current_url:
-                # Try waiting for URL change
-                try:
-                    page.wait_for_url("**/request_token=**", timeout=10000)
-                    current_url = page.url
-                except Exception:
-                    pass
-
-            if "request_token=" not in current_url:
-                # Screenshot for debug
+            if not captured_token["value"]:
                 page.screenshot(path="/tmp/login_debug.png")
-                raise Exception(f"request_token not found. URL: {current_url}")
-
-            request_token = current_url.split("request_token=")[1].split("&")[0]
-            log.info(f"✅ request_token captured: {request_token[:8]}...")
+                raise Exception("request_token not captured within timeout.")
 
         except Exception as e:
             log.error(f"Login error: {e}")
@@ -180,10 +179,12 @@ def auto_login() -> str:
         finally:
             browser.close()
 
-    # ── Step 8: Generate Access Token ──
-    data = kite.generate_session(request_token, api_secret=API_SECRET)
+    # ── Generate Access Token ──
+    request_token = captured_token["value"]
+    log.info(f"🔑 Generating session with request_token: {request_token[:8]}...")
+    data         = kite.generate_session(request_token, api_secret=API_SECRET)
     access_token = data["access_token"]
-    log.info(f"✅ Access token generated!")
+    log.info("✅ Access token generated!")
     return access_token
 
 
