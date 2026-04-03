@@ -8,7 +8,10 @@ nixPkgs = [
 ]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "pip install -r requirements.txt",
+  "pip install undetected-chromedriver"
+]
 
 [start]
 cmd = "python run_bot.py"
