@@ -1,8 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   KITE AUTO-LOGIN HELPER                                         ║
-║   Intercepts 127.0.0.1 redirect to capture request_token        ║
-║   Works on Railway/headless containers                           ║
+║   KITE AUTO-LOGIN HELPER — FINAL FIX                             ║
+║   Uses page.on('request') to catch 127.0.0.1 redirect           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -93,61 +92,35 @@ def auto_login() -> str:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-setuid-sandbox",
-                "--disable-web-security",
             ]
         )
-        context = browser.new_context(
-            # Intercept navigator errors on 127.0.0.1 — don't block JS
-            ignore_https_errors=True,
-        )
-        page = context.new_page()
+        context = browser.new_context()
+        page    = context.new_page()
 
-        # ── CORE FIX: Route 127.0.0.1 requests ──────────────────────────
-        # Zerodha redirects to http://127.0.0.1/?request_token=XXX after login.
-        # In a Railway container, this URL is unreachable → navigation fails.
-        # We intercept it BEFORE the browser tries to connect, extract the token,
-        # then abort the request so the browser doesn't hang/error.
-        def handle_redirect(route):
-            url = route.request.url
-            log.info(f"🔀 Intercepted redirect: {url[:80]}")
-            if "request_token=" in url:
-                token = url.split("request_token=")[1].split("&")[0]
-                captured_token["value"] = token
-                log.info(f"✅ request_token captured via route intercept: {token[:8]}...")
-            # Abort the request — we don't need the browser to actually load 127.0.0.1
-            try:
-                route.abort()
-            except Exception:
-                pass
-
-        # Intercept ALL requests to 127.0.0.1 (any port)
-        context.route("**//*127.0.0.1*/**", handle_redirect)
-        context.route("http://127.0.0.1*", handle_redirect)
-        context.route("https://127.0.0.1*", handle_redirect)
-
-        # Also catch via request event as backup
+        # ── KEY FIX: Listen to ALL requests via event ──
+        # context.route blocks some requests before event fires
+        # page.on('request') catches EVERYTHING including failed navigations
         def on_request(request):
             url = request.url
             if "request_token=" in url:
                 token = url.split("request_token=")[1].split("&")[0]
-                if not captured_token["value"]:
-                    captured_token["value"] = token
-                    log.info(f"✅ request_token from request event: {token[:8]}...")
+                captured_token["value"] = token
+                log.info(f"✅ request_token captured from request event: {token[:8]}...")
 
+        # Also listen on response — sometimes token is in redirect response header
         def on_response(response):
             url = response.url
             if "request_token=" in url:
                 token = url.split("request_token=")[1].split("&")[0]
-                if not captured_token["value"]:
-                    captured_token["value"] = token
-                    log.info(f"✅ request_token from response event: {token[:8]}...")
+                captured_token["value"] = token
+                log.info(f"✅ request_token captured from response event: {token[:8]}...")
+            # Check Location header for redirect
             try:
                 location = response.headers.get("location", "")
                 if "request_token=" in location:
                     token = location.split("request_token=")[1].split("&")[0]
-                    if not captured_token["value"]:
-                        captured_token["value"] = token
-                        log.info(f"✅ request_token from Location header: {token[:8]}...")
+                    captured_token["value"] = token
+                    log.info(f"✅ request_token from Location header: {token[:8]}...")
             except Exception:
                 pass
 
@@ -155,6 +128,7 @@ def auto_login() -> str:
         page.on("response", on_response)
 
         try:
+            # Open login
             log.info("Opening Kite login page...")
             page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(2000)
@@ -173,7 +147,7 @@ def auto_login() -> str:
             log.info("🔐 Credentials submitted...")
             page.wait_for_timeout(3000)
 
-            # TOTP field
+            # TOTP — field label is "External TOTP" (not type=number on all browsers)
             log.info("Waiting for TOTP field...")
             totp_selector = None
             for sel in [
@@ -209,7 +183,7 @@ def auto_login() -> str:
             page.fill(totp_selector, totp_code)
             page.wait_for_timeout(600)
 
-            # Submit TOTP
+            # Submit TOTP — button text is "Continue"
             for btn_sel in [
                 "button:has-text('Continue')",
                 "button[type='submit']",
@@ -222,44 +196,22 @@ def auto_login() -> str:
                 except Exception:
                     continue
 
-            # Wait for token capture — route intercept should fire almost instantly
+            # Wait for request_token to be captured (20 sec max)
             log.info("⏳ Waiting for request_token...")
-            for _ in range(60):  # 30 sec max
+            for _ in range(40):
                 if captured_token["value"]:
                     break
                 time.sleep(0.5)
 
-            # Final fallback — check current page URL
+            # Last resort: check current URL directly
             if not captured_token["value"]:
-                try:
-                    current = page.url
-                    log.info(f"Final URL check: {current}")
-                    if "request_token=" in current:
-                        captured_token["value"] = current.split("request_token=")[1].split("&")[0]
-                except Exception:
-                    pass
-
-            # Last resort — check page content for token
-            if not captured_token["value"]:
-                try:
-                    content = page.content()
-                    if "request_token=" in content:
-                        captured_token["value"] = content.split("request_token=")[1].split("&")[0].split('"')[0].split("'")[0]
-                        log.info(f"✅ request_token from page content: {captured_token['value'][:8]}...")
-                except Exception:
-                    pass
+                current = page.url
+                log.info(f"Final URL check: {current}")
+                if "request_token=" in current:
+                    captured_token["value"] = current.split("request_token=")[1].split("&")[0]
 
             if not captured_token["value"]:
-                # Take screenshot for debug
-                try:
-                    page.screenshot(path="/tmp/login_debug.png")
-                    log.info("Screenshot saved to /tmp/login_debug.png")
-                except Exception:
-                    pass
-                raise Exception(
-                    f"request_token not captured after 30s. "
-                    f"Page URL: {page.url}"
-                )
+                raise Exception(f"request_token not captured. Page URL: {page.url}")
 
         except Exception as e:
             log.error(f"Login error: {e}")

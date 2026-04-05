@@ -12,4 +12,5 @@ cmds = [
   "python -m playwright install-deps chromium",
 ]
 
-# [start] section intentionally removed — Procfile handles the start command
+[start]
+cmd = "python run_bot.py"

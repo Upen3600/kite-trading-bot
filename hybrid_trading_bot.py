@@ -38,9 +38,6 @@ SL_PERCENT         = 30
 TARGET_PERCENT     = 60
 STRIKE_OFFSET      = {"BANKNIFTY": 100, "NIFTY": 50}
 
-# Trade update interval — send Telegram update every N minutes if trade active
-TRADE_UPDATE_INTERVAL_MIN = 15
-
 # Trade log file (persisted for dashboard)
 TRADE_LOG_FILE = "/tmp/trades_log.json"
 
@@ -221,8 +218,6 @@ class HybridStrategy:
         self.daily_pnl   = 0.0
         self.active      = None
         self.trades_log  = []
-        # Track last trade update time per strategy
-        self._last_update_time: datetime = None
 
     def set_orb(self):
         df = get_ohlc(self.token, "5minute", days=1)
@@ -315,8 +310,6 @@ class HybridStrategy:
             "entry_time": ist_full(),
         }
         self.trade_today += 1
-        # Reset update timer when new trade opens
-        self._last_update_time = now_ist()
 
         send_telegram(
             f"🚨 <b>TRADE ALERT — {self.symbol}</b>\n"
@@ -333,16 +326,8 @@ class HybridStrategy:
         )
         log.info(f"{self.symbol}: Trade opened → {opt_sym} @ ₹{opt_ltp}")
 
-    def monitor_trade(self):
-        """
-        Monitor active trade.
-        - SL/Target hit → close immediately (always send alert)
-        - Periodic update → only if TRADE_UPDATE_INTERVAL_MIN passed since last update
-        - No active trade → do nothing, no Telegram message
-        """
-        if not self.active:
-            return  # ← KEY FIX: koi active trade nahi to kuch mat bhejo
-
+    def monitor_trade(self, send_update=False):
+        if not self.active: return
         t = self.active
         try:
             ltp_d   = kite.ltp([f"NFO:{t['opt_token']}"])
@@ -358,25 +343,16 @@ class HybridStrategy:
             self._close("🛑 SL HIT", cur_ltp, pnl)
         elif cur_ltp >= t["target"]:
             self._close("🎯 TARGET HIT", cur_ltp, pnl)
-        else:
-            # Periodic update — only if enough time has passed
-            now = now_ist()
-            minutes_since_update = (
-                (now - self._last_update_time).total_seconds() / 60
-                if self._last_update_time else TRADE_UPDATE_INTERVAL_MIN + 1
+        elif send_update:
+            send_telegram(
+                f"📊 <b>TRADE UPDATE — {t['symbol']}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 {t['opt_sym']}\n"
+                f"💰 Entry: ₹{t['entry']:.1f}  →  LTP: ₹{cur_ltp:.1f}\n"
+                f"{'🟢' if pnl>=0 else '🔴'} <b>P&amp;L: ₹{pnl:+,.0f}  ({pct:+.1f}%)</b>\n"
+                f"📦 Lots: {t['lots']}\n"
+                f"⏰ {ist_str()}"
             )
-            if minutes_since_update >= TRADE_UPDATE_INTERVAL_MIN:
-                self._last_update_time = now
-                send_telegram(
-                    f"📊 <b>TRADE UPDATE — {t['symbol']}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 {t['opt_sym']}\n"
-                    f"💰 Entry: ₹{t['entry']:.1f}  →  LTP: ₹{cur_ltp:.1f}\n"
-                    f"{'🟢' if pnl>=0 else '🔴'} <b>P&amp;L: ₹{pnl:+,.0f}  ({pct:+.1f}%)</b>\n"
-                    f"📦 Lots: {t['lots']}\n"
-                    f"🛑 SL: ₹{t['sl']:.1f}  |  🎯 Target: ₹{t['target']:.1f}\n"
-                    f"⏰ {ist_str()}"
-                )
 
     def _close(self, status: str, exit_ltp: float, pnl: float):
         t = self.active
@@ -411,7 +387,6 @@ class HybridStrategy:
         self.trades_log.append(rec)
         append_trade(rec)
         self.active = None
-        self._last_update_time = None
         log.info(f"{t['symbol']} closed: {status} | P&L: ₹{pnl:+,.0f}")
 
     def force_squareoff(self):
@@ -433,7 +408,6 @@ class HybridStrategy:
         self.daily_pnl   = 0.0
         self.active      = None
         self.trades_log  = []
-        self._last_update_time = None
         log.info(f"{self.symbol}: Day reset ✅")
 
 
@@ -444,6 +418,7 @@ class HybridBot:
     def __init__(self):
         self.bn  = HybridStrategy("BANKNIFTY", BANKNIFTY_TOKEN)
         self.nf  = HybridStrategy("NIFTY",     NIFTY_TOKEN)
+        self._last_update = now_ist()
 
     def market_open_alert(self):
         bn_ltp = get_ltp(BANKNIFTY_TOKEN)
@@ -486,13 +461,12 @@ class HybridBot:
                 s.execute_trade(sig)
 
     def run_monitor(self):
-        """
-        Called every 5 min by scheduler.
-        Each strategy handles its own update throttling internally.
-        No Telegram sent unless trade is active.
-        """
-        self.bn.monitor_trade()
-        self.nf.monitor_trade()
+        now = now_ist()
+        send_upd = (now - self._last_update).seconds >= 900
+        self.bn.monitor_trade(send_update=send_upd)
+        self.nf.monitor_trade(send_update=send_upd)
+        if send_upd:
+            self._last_update = now
 
     def run_squareoff(self):
         self.bn.force_squareoff()
@@ -522,11 +496,13 @@ class HybridBot:
         data = {}
         for sym, token in [("bn", BANKNIFTY_TOKEN), ("nf", NIFTY_TOKEN)]:
             try:
+                # LTP + OHLC quote
                 quote = kite.quote([f"NSE:{token}"])
                 q     = list(quote.values())[0]
                 ltp   = q["last_price"]
                 ohlc  = q.get("ohlc", {})
 
+                # 5min candles for EMA50 & EMA200
                 df = get_ohlc(token, "5minute", days=10)
                 ema50  = float(calc_ema(df["close"], 50).iloc[-1])  if not df.empty else 0
                 ema200 = float(calc_ema(df["close"], 200).iloc[-1]) if not df.empty else 0
