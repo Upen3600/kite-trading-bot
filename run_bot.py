@@ -96,6 +96,31 @@ def start():
     init_kite(token)
     bot = HybridBot()
 
+    # ── KiteTicker — tick by tick WebSocket ──
+    from dashboard import start_ticker, update_ema
+    start_ticker(token)
+    log.info("📡 KiteTicker WebSocket started — tick by tick live!")
+
+    # ── EMA updater — every 5 min, push to dashboard ──
+    def push_ema():
+        from hybrid_trading_bot import get_ohlc, calc_ema
+        for sym, tk, skey in [("BANKNIFTY", BANKNIFTY_TOKEN, "bn"),
+                               ("NIFTY",     NIFTY_TOKEN,     "nf")]:
+            try:
+                df = get_ohlc(tk, "5minute", days=10)
+                if df.empty: continue
+                e50  = float(calc_ema(df["close"], 50).iloc[-1])
+                e200 = float(calc_ema(df["close"], 200).iloc[-1])
+                update_ema(skey, e50, e200)
+            except Exception as e:
+                log.error(f"EMA push error ({sym}): {e}")
+
+    sched(9,  35, push_ema)
+    for h in range(9, 16):
+        for m in range(0, 60, 5):
+            if h == 9 and m < 35: continue
+            sched(h, m, push_ema)
+
     # ── Daily refresh at 8:45 AM IST ──
     def refresh_token():
         log.info("🔄 Refreshing token (8:45 AM IST)...")
@@ -103,6 +128,8 @@ def start():
             new_token = get_access_token(force_refresh=True)
             init_kite(new_token)
             bot.reset_day()
+            start_ticker(new_token)   # Restart WebSocket with new token
+            log.info("✅ Token refreshed + Ticker restarted.")
         except Exception as e:
             send_telegram(f"❌ <b>Token Refresh Failed</b>\n{str(e)[:200]}")
 

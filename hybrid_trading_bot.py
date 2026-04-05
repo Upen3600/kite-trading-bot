@@ -490,6 +490,42 @@ class HybridBot:
         msg += f"━━━━━━━━━━━━━━━━━━━━━\n💵 <b>Net: ₹{total_pnl:+,.0f}</b>"
         send_telegram(msg)
 
+    def update_market_data(self):
+        """Fetch LTP, Day H/L, EMA50/200 for dashboard — runs every 10s via thread."""
+        MARKET_FILE = "/tmp/market_data.json"
+        data = {}
+        for sym, token in [("bn", BANKNIFTY_TOKEN), ("nf", NIFTY_TOKEN)]:
+            try:
+                # LTP + OHLC quote
+                quote = kite.quote([f"NSE:{token}"])
+                q     = list(quote.values())[0]
+                ltp   = q["last_price"]
+                ohlc  = q.get("ohlc", {})
+
+                # 5min candles for EMA50 & EMA200
+                df = get_ohlc(token, "5minute", days=10)
+                ema50  = float(calc_ema(df["close"], 50).iloc[-1])  if not df.empty else 0
+                ema200 = float(calc_ema(df["close"], 200).iloc[-1]) if not df.empty else 0
+
+                data[sym] = {
+                    "ltp":        round(ltp, 2),
+                    "day_high":   round(ohlc.get("high",  ltp), 2),
+                    "day_low":    round(ohlc.get("low",   ltp), 2),
+                    "prev_close": round(ohlc.get("close", ltp), 2),
+                    "ema50":      round(ema50,  2),
+                    "ema200":     round(ema200, 2),
+                    "updated":    now_ist().strftime("%H:%M:%S"),
+                }
+            except Exception as e:
+                log.error(f"Market data error ({sym}): {e}")
+                data[sym] = {}
+        try:
+            import json as _json
+            with open(MARKET_FILE, "w") as f:
+                _json.dump(data, f)
+        except Exception as e:
+            log.error(f"Market file write error: {e}")
+
     def reset_day(self):
         self.bn.reset_day()
         self.nf.reset_day()
