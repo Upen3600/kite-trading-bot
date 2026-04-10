@@ -1,9 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   MAIN LAUNCHER — Hybrid Trading Bot + Dashboard                 ║
-║   Timezone: IST (Asia/Kolkata)                                   ║
-║   Login: 8:45 AM IST daily (auto token refresh)                  ║
-║   Dashboard: Live on Railway public URL                          ║
+║   MAIN LAUNCHER v2.0 — Hybrid Bot + Dashboard                    ║
+║   Fixed: NameError crash, duplicate alerts, market data thread   ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -26,6 +24,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Token constants (needed in push_ema) ──
+BANKNIFTY_TOKEN = int(os.environ.get("BANKNIFTY_TOKEN", "260105"))
+NIFTY_TOKEN     = int(os.environ.get("NIFTY_TOKEN",     "256265"))
+
 
 # ─────────────────────────────────────────────
 #  PLAYWRIGHT INSTALL
@@ -36,14 +38,19 @@ def ensure_playwright():
     if os.path.exists(browser_path):
         for _, _, files in os.walk(browser_path):
             if any("chrome" in f.lower() for f in files):
-                ready = True; break
+                ready = True
+                break
     if not ready:
         log.info("📦 Installing Playwright Chromium...")
-        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
-                       check=True, timeout=300)
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True, timeout=300
+        )
         try:
-            subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"],
-                           check=True, timeout=120)
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                check=True, timeout=120
+            )
         except Exception:
             pass
         log.info("✅ Playwright ready.")
@@ -52,93 +59,114 @@ def ensure_playwright():
 
 
 # ─────────────────────────────────────────────
-#  IST → UTC for schedule library
+#  IST → UTC conversion for schedule library
+#  Railway server runs UTC — IST = UTC + 5:30
 # ─────────────────────────────────────────────
 def sched(hh: int, mm: int, fn):
     total = hh * 60 + mm - 330
-    if total < 0: total += 1440
-    t = f"{total//60:02d}:{total%60:02d}"
+    if total < 0:
+        total += 1440
+    t = f"{total // 60:02d}:{total % 60:02d}"
     schedule.every().day.at(t).do(fn)
-    log.info(f"Scheduled {fn.__name__} at {hh:02d}:{mm:02d} IST → {t} UTC")
+    log.info(f"  Scheduled {fn.__name__:30s} → {hh:02d}:{mm:02d} IST ({t} UTC)")
 
 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 def start():
-    print("\n" + "═"*55)
-    print("  🤖  HYBRID TRADING BOT + DASHBOARD")
-    print("  📊  BankNifty & Nifty | ORB+EMA+VWAP+ST")
-    print("  ⏰  IST Timezone | Login: 8:45 AM daily")
-    print("  🌐  Dashboard: Check Railway public URL")
-    print("═"*55 + "\n")
+    print("\n" + "═" * 55)
+    print("  ⚡ HYBRID TRADING BOT v2.0")
+    print("  📊 BankNifty & Nifty | ORB+EMA9/21+VWAP+ST")
+    print("  ⏰ IST Timezone | Auto-login 8:45 AM daily")
+    print("  🌐 Dashboard: Railway public URL")
+    print("═" * 55 + "\n")
 
     ensure_playwright()
 
-    from kite_auto_login import get_access_token
-    from hybrid_trading_bot import HybridBot, init_kite, send_telegram
-    from dashboard import run_dashboard
+    # ── Imports ──
+    from kite_auto_login  import get_access_token
+    from hybrid_trading_bot import (HybridBot, init_kite, send_telegram,
+                                    get_ohlc, calc_ema)
+    from dashboard import run_dashboard, start_ticker, update_ema
 
-    # ── Start dashboard in background thread ──
-    dash_thread = threading.Thread(target=run_dashboard, daemon=True)
-    dash_thread.start()
-    log.info("🌐 Dashboard started in background.")
+    # ── Start dashboard (background) ──
+    threading.Thread(target=run_dashboard, daemon=True).start()
+    log.info("🌐 Dashboard thread started.")
 
     # ── Initial login ──
     log.info("🔐 Logging in to Kite...")
     try:
         token = get_access_token()
+        log.info("✅ Token obtained.")
     except Exception as e:
         log.error(f"Login failed: {e}")
-        send_telegram(f"❌ <b>Bot Failed to Start</b>\n{str(e)[:200]}")
+        # send_telegram without init — use requests directly
+        import requests as _req
+        tg_token = os.environ.get("TELEGRAM_TOKEN",
+                                  "8620220458:AAG-oxvhWhPio7iX9pWCk-0AFovl5KrUXxc")
+        tg_chat  = os.environ.get("TELEGRAM_CHAT_ID", "-1003780954866")
+        _req.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                  json={"chat_id": tg_chat,
+                        "text": f"❌ <b>Bot Failed to Start</b>\n{str(e)[:200]}",
+                        "parse_mode": "HTML"}, timeout=10)
         return
 
     init_kite(token)
     bot = HybridBot()
 
-    # ── KiteTicker — tick by tick WebSocket ──
-    from dashboard import start_ticker, update_ema
+    # ── KiteTicker — tick by tick ──
     start_ticker(token)
-    log.info("📡 KiteTicker WebSocket started — tick by tick live!")
+    log.info("📡 KiteTicker started — tick by tick live!")
 
-    # ── EMA updater — every 5 min, push to dashboard ──
+    # ── Market data updater (fallback for EMA/OHLC when market closed) ──
+    def market_data_loop():
+        while True:
+            try:
+                bot.update_market_data()
+            except Exception as e:
+                log.error(f"Market data loop error: {e}")
+            time.sleep(30)   # every 30s — tick handles live LTP
+
+    threading.Thread(target=market_data_loop, daemon=True).start()
+    log.info("📊 Market data updater started (30s interval).")
+
+    # ── EMA push to dashboard every 5 min ──
     def push_ema():
-        from hybrid_trading_bot import get_ohlc, calc_ema
-        for sym, tk, skey in [("BANKNIFTY", BANKNIFTY_TOKEN, "bn"),
-                               ("NIFTY",     NIFTY_TOKEN,     "nf")]:
+        for sym_key, tk in [("bn", BANKNIFTY_TOKEN), ("nf", NIFTY_TOKEN)]:
             try:
                 df = get_ohlc(tk, "5minute", days=10)
-                if df.empty: continue
+                if df.empty:
+                    continue
                 e50  = float(calc_ema(df["close"], 50).iloc[-1])
                 e200 = float(calc_ema(df["close"], 200).iloc[-1])
-                update_ema(skey, e50, e200)
+                update_ema(sym_key, e50, e200)
+                log.info(f"EMA pushed {sym_key.upper()}: EMA50={e50:.1f} EMA200={e200:.1f}")
             except Exception as e:
-                log.error(f"EMA push error ({sym}): {e}")
+                log.error(f"EMA push error ({sym_key}): {e}")
 
-    sched(9,  35, push_ema)
-    for h in range(9, 16):
-        for m in range(0, 60, 5):
-            if h == 9 and m < 35: continue
-            sched(h, m, push_ema)
-
-    # ── Daily refresh at 8:45 AM IST ──
+    # ── Daily token refresh at 8:45 AM IST ──
     def refresh_token():
         log.info("🔄 Refreshing token (8:45 AM IST)...")
         try:
             new_token = get_access_token(force_refresh=True)
             init_kite(new_token)
             bot.reset_day()
-            start_ticker(new_token)   # Restart WebSocket with new token
+            start_ticker(new_token)
             log.info("✅ Token refreshed + Ticker restarted.")
         except Exception as e:
+            log.error(f"Token refresh failed: {e}")
             send_telegram(f"❌ <b>Token Refresh Failed</b>\n{str(e)[:200]}")
 
-    # ─── All schedules in IST ───────────────
+    # ─────────────────────────────────────────
+    #  SCHEDULE (all times IST)
+    # ─────────────────────────────────────────
+    log.info("\n📅 Scheduling jobs (IST):")
     sched(8,  45, refresh_token)           # Token refresh + day reset
-    sched(9,  15, bot.market_open_alert)   # Market open: BN & NF LTP
-    sched(9,  31, bot.run_orb_setup)       # ORB after 9:30 close
+    sched(9,  15, bot.market_open_alert)   # Market open alert
+    sched(9,  31, bot.run_orb_setup)       # ORB set after 9:30
 
-    # Signal + Monitor every 5 min: 9:35 → 14:00
+    # Signal check + monitor: every 5 min from 9:35 to 14:00
     for h in range(9, 15):
         for m in range(0, 60, 5):
             if h == 9  and m < 35: continue
@@ -146,17 +174,34 @@ def start():
             sched(h, m, bot.run_signal_check)
             sched(h, m, bot.run_monitor)
 
-    sched(15, 10, bot.run_squareoff)       # Force squareoff + daily summary
+    # EMA push: every 5 min from 9:35 to 15:30
+    for h in range(9, 16):
+        for m in range(0, 60, 5):
+            if h == 9  and m < 35: continue
+            if h == 15 and m > 30: break
+            sched(h, m, push_ema)
+
+    sched(15, 10, bot.run_squareoff)       # EOD squareoff + summary
     sched(15, 30, bot.market_close_alert)  # Market close alert
 
-    log.info("🚀 Bot LIVE! Scheduler running...")
+    # ─────────────────────────────────────────
+    #  STARTUP COMPLETE
+    # ─────────────────────────────────────────
+    now_ist = datetime.now(IST)
     send_telegram(
-        f"🚀 <b>Bot + Dashboard LIVE!</b>\n"
-        f"📅 {datetime.now(IST).strftime('%d %b %Y %H:%M IST')}\n"
+        f"🚀 <b>Bot v2.0 LIVE!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 {now_ist.strftime('%d %b %Y %H:%M IST')}\n"
         f"✅ Kite connected\n"
-        f"🌐 Dashboard: Check Railway → Settings → Networking → Public URL\n"
-        f"⏳ Next event: Market open alert at 9:15 AM IST"
+        f"📡 KiteTicker WebSocket active\n"
+        f"🌐 Dashboard: Railway → Settings → Networking\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Strategy:</b> ORB + EMA9/21 + VWAP + Supertrend\n"
+        f"⏰ <b>Trade window:</b> 9:31 AM – 2:00 PM IST\n"
+        f"🛑 <b>SL:</b> 30%  |  🎯 <b>Target:</b> 60%\n"
+        f"⏳ Market opens at 9:15 AM IST"
     )
+    log.info("🚀 Bot LIVE! Entering scheduler loop...")
 
     while True:
         schedule.run_pending()

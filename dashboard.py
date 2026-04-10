@@ -318,6 +318,15 @@ tr:last-child td{border-bottom:none} tr:hover td{background:#1a1d2e}
 
 .nodata{text-align:center;color:#2d3748;padding:24px;font-size:13px}
 .rnote{font-size:10px;color:#2d3748;text-align:center;margin-top:14px;padding-bottom:8px}
+/* active trade panel */
+.atrade{background:#12151f;border:2px solid #f6c90e55;border-radius:14px;padding:16px 18px;margin-bottom:20px}
+.atrade-none{background:#12151f;border:1px solid #1e2535;border-radius:14px;padding:14px 18px;margin-bottom:20px;text-align:center;color:#4a5568;font-size:13px}
+.at-title{font-size:10px;color:#f6c90e;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.at-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(115px,1fr));gap:8px}
+.at-box{background:#0f1117;border-radius:8px;padding:8px 10px}
+.at-lbl{font-size:9px;color:#4a5568;text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px}
+.at-val{font-size:14px;font-weight:800;font-variant-numeric:tabular-nums}
+.at-pnl{font-size:22px;font-weight:900;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -412,7 +421,12 @@ tr:last-child td{border-bottom:none} tr:hover td{background:#1a1d2e}
     </div>
   </div>
 
-  <!-- Summary -->
+
+  <!-- Active Trade -->
+  <div class="slabel">Active Position</div>
+  <div id="active-trade-panel" class="atrade-none">No open position</div>
+
+    <!-- Summary -->
   <div class="slabel">Performance</div>
   <div class="sgrid">
     <div class="sc"><div class="sl">Today P&amp;L</div><div class="sv" id="s1">—</div><div class="ss" id="s1s">—</div></div>
@@ -582,6 +596,35 @@ function renderTrades(trades){
     </table>`:'<div class="nodata">No trades yet</div>';
 }
 
+
+// ── Active Trade Panel ──────────────────
+function renderActiveTrade(d){
+  const panel=document.getElementById('active-trade-panel');
+  if(!d||!d.active){
+    panel.className='atrade-none';
+    panel.innerHTML='No open position';
+    return;
+  }
+  const a=d.active;
+  const ltp=prevLtp[a.sym_key]||a.entry;
+  const pnl=(ltp-a.entry)*a.lots*(a.symbol==='BANKNIFTY'?15:50);
+  const pct=(ltp-a.entry)/a.entry*100;
+  const pc=pnl>=0?'#48bb78':'#fc8181';
+  panel.className='atrade';
+  panel.innerHTML=`
+    <div class="at-title"><span class="dot ${pnl>=0?'dot-g':'dot-r'}" style="animation:p 1s infinite"></span>LIVE TRADE — ${a.symbol}</div>
+    <div class="at-grid">
+      <div class="at-box"><div class="at-lbl">Option</div><div class="at-val" style="font-size:12px;color:#a0aec0">${a.opt_sym}</div></div>
+      <div class="at-box"><div class="at-lbl">Direction</div><div class="at-val" style="color:${a.direction==='CALL'?'#48bb78':'#fc8181'}">${a.direction==='CALL'?'▲ CALL CE':'▼ PUT PE'}</div></div>
+      <div class="at-box"><div class="at-lbl">Entry</div><div class="at-val">₹${a.entry.toFixed(2)}</div></div>
+      <div class="at-box"><div class="at-lbl">Live LTP</div><div class="at-val" style="color:${ltp>a.entry?'#48bb78':'#fc8181'}">₹${ltp.toFixed(2)}</div></div>
+      <div class="at-box"><div class="at-lbl">SL</div><div class="at-val" style="color:#fc8181">₹${a.sl.toFixed(2)}</div></div>
+      <div class="at-box"><div class="at-lbl">Target</div><div class="at-val" style="color:#48bb78">₹${a.target.toFixed(2)}</div></div>
+      <div class="at-box"><div class="at-lbl">Lots</div><div class="at-val">${a.lots}</div></div>
+      <div class="at-box" style="border:1px solid ${pc}44"><div class="at-lbl">Live P&L</div><div class="at-pnl" style="color:${pc}">${pnl>=0?'+':''}₹${Math.round(pnl).toLocaleString('en-IN')} (${pct>=0?'+':''}${pct.toFixed(1)}%)</div></div>
+    </div>`;
+}
+
 // ── Socket.IO ─────────────────────────────
 const socket=io({transports:['websocket','polling']});
 
@@ -616,6 +659,18 @@ socket.on('snapshot',d=>{
   if(d.trades) renderTrades(d.trades);
 });
 
+
+// Active trade: poll every 5s
+async function pollActive(){
+  try{
+    const r=await fetch('/api/active');
+    const d=await r.json();
+    renderActiveTrade(d);
+  }catch(e){}
+}
+setInterval(pollActive,5000);
+pollActive();
+
 // Poll trades every 30s (new trades may come in)
 setInterval(async()=>{
   try{const r=await fetch('/api/trades');const t=await r.json();renderTrades(t);}catch(e){}
@@ -624,6 +679,23 @@ setInterval(async()=>{
 </body>
 </html>"""
 
+
+
+# ── Active trade shared state (set by bot) ──
+_active_trades = {}
+
+def set_active_trade(symbol: str, trade_data: dict):
+    """Called by bot when trade opens/closes."""
+    sym_key = "bn" if symbol == "BANKNIFTY" else "nf"
+    if trade_data:
+        _active_trades[sym_key] = {**trade_data, "sym_key": sym_key}
+    else:
+        _active_trades.pop(sym_key, None)
+
+@app.route("/api/active")
+def api_active_route():
+    active = list(_active_trades.values())
+    return {"active": active[0] if active else None}
 
 # ─────────────────────────────────────────────
 #  START
